@@ -113,10 +113,27 @@ function accountNotFoundError(input: string): { content: { type: "text"; text: s
       text: JSON.stringify({
         error: `Could not match "${input}" to any CallRail account.`,
         available_accounts: available,
-        tip: "Try a partial name like 'blue', 'thomas', or 'clarity'."
+        tip: "Try a partial name like 'blue', 'thomas', or 'clarity'. Leave account blank to query all accounts."
       }, null, 2)
     }]
   };
+}
+
+// Run a GET request across all accounts and merge results
+async function allAccountsRequest(
+  pathTemplate: (accountId: string) => string,
+  params?: Record<string, string | number | boolean | undefined>
+): Promise<{ content: { type: "text"; text: string }[] }> {
+  const results: Record<string, unknown> = {};
+  for (const [name, cfg] of Object.entries(ACCOUNTS)) {
+    try {
+      const data = await callrailRequest("GET", pathTemplate(cfg.account_id), cfg.api_key, params);
+      results[name] = data;
+    } catch (e: unknown) {
+      results[name] = { error: e instanceof Error ? e.message : String(e) };
+    }
+  }
+  return { content: [{ type: "text", text: JSON.stringify(results, null, 2) }] };
 }
 
 // ---------------------------------------------------------------------------
@@ -164,13 +181,23 @@ async function callrailRequest(
 }
 
 // Shorthand used inside tools: resolves account, then fires request
+// If accountInput is undefined/empty and only one account exists, uses it automatically.
 async function acctRequest(
-  accountInput: string,
+  accountInput: string | undefined,
   method: string,
   pathTemplate: (accountId: string) => string,
   params?: Record<string, string | number | boolean | undefined>,
   body?: Record<string, unknown>
 ): Promise<{ data: unknown; matchedName: string } | { notFound: ReturnType<typeof accountNotFoundError> }> {
+  if (!accountInput) {
+    const names = Object.keys(ACCOUNTS);
+    if (names.length === 1) {
+      const cfg = ACCOUNTS[names[0]];
+      const data = await callrailRequest(method, pathTemplate(cfg.account_id), cfg.api_key, params, body);
+      return { data, matchedName: names[0] };
+    }
+    return { notFound: accountNotFoundError("(none specified)") };
+  }
   const resolved = resolveAccount(accountInput);
   if (!resolved) return { notFound: accountNotFoundError(accountInput) };
   const { config, matchedName } = resolved;
@@ -183,8 +210,9 @@ async function acctRequest(
 // ---------------------------------------------------------------------------
 
 function createServer(): McpServer {
+  const accountNames = Object.keys(ACCOUNTS).join(", ") || "default";
   const server = new McpServer({
-    name: "callrail-mcp",
+    name: `callrail-mcp (accounts: ${accountNames})`,
     version: "2.0.0",
   });
 
@@ -194,7 +222,7 @@ function createServer(): McpServer {
 
   server.tool(
     "list_accounts",
-    "List all configured CallRail accounts. Use the account name (or a fuzzy partial) in the 'account' argument of all other tools. Fuzzy matching is supported — 'blue', 'thomas', 'clarity' all resolve automatically.",
+    `List all configured CallRail accounts. Available accounts: ${Object.keys(ACCOUNTS).join(", ")}. Use any account name (or a fuzzy partial) in the 'account' argument of all other tools — e.g. 'blue', 'thomas', 'clarity'. Leave 'account' blank on any tool to query all accounts at once.`,
     {},
     async () => {
       const accounts = Object.entries(ACCOUNTS).map(([name, cfg]) => ({
@@ -213,7 +241,7 @@ function createServer(): McpServer {
     "list_calls",
     "List all calls for a CallRail account. Fuzzy matches the account name — 'blue', 'thomas', 'clarity' all work. Supports filtering by company, date, direction, lead status, tags, source, and more.",
     {
-      account: z.string().describe("Account name — fuzzy matched. Use list_accounts to see all options."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       company_id: z.string().optional().describe("Filter to a specific Company ID"),
       start_date: z.string().optional().describe("Start date (ISO 8601, e.g. 2024-01-01)"),
       end_date: z.string().optional().describe("End date (ISO 8601, e.g. 2024-01-31)"),
@@ -232,6 +260,7 @@ function createServer(): McpServer {
       fields: z.string().optional().describe("Comma-separated extra fields: call_type, campaign, tags, transcription, conversational_transcript, call_summary, call_highlights, lead_score, agent_email, company_id, company_name, device_type, first_call, keywords, landing_page_url, lead_status, medium, note, source, utm_campaign, utm_content, utm_medium, utm_source, utm_term, value, milestones, sentiment"),
     },
     async ({ account, ...rest }) => {
+      if (!account) return allAccountsRequest((id) => `/a/${id}/calls.json`, rest as Record<string, string | number | boolean | undefined>);
       const result = await acctRequest(account, "GET", (id) => `/a/${id}/calls.json`, rest as Record<string, string | number | boolean | undefined>);
       if ("notFound" in result) return result.notFound;
       return { content: [{ type: "text", text: JSON.stringify(result.data, null, 2) }] };
@@ -242,7 +271,7 @@ function createServer(): McpServer {
     "get_call",
     "Retrieve a single call by ID with optional extra fields like transcription, milestones, AI summaries, etc.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       call_id: z.string().describe("Call ID (e.g. CAL8154748ae6bd4e278a7cddd38a662f4f)"),
       fields: z.string().optional().describe("Comma-separated extra fields: keywords_spotted, milestones, transcription, call_type, campaign, tags, conversational_transcript, call_summary, call_highlights, lead_score, lead_score_explanation, agent_email, company_id, company_name, company_time_zone, created_at, device_type, fbclid, first_call, formatted_call_type, formatted_customer_location, formatted_business_phone_number, formatted_customer_name, formatted_customer_name_or_phone_number, formatted_customer_phone_number, formatted_duration, formatted_tracking_phone_number, formatted_tracking_source, formatted_value, ga, gclid, good_lead_call_id, good_lead_call_time, integration_data, keypad_entries, keywords, landing_page_url, last_requested_url, lead_status, medium, msclkid, note, person_id, prior_calls, referrer_domain, referring_url, sentiment, session_uuid, source, source_name, speaker_percent, timeline_url, total_calls, tracker_id, utm_campaign, utm_content, utm_medium, utm_source, utm_term, value, voice_assist_message, waveforms, zip_code"),
     },
@@ -259,7 +288,7 @@ function createServer(): McpServer {
     "create_outbound_call",
     "Initiate an outbound call. US/Canada numbers only. Rate limited.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       caller_id: z.number().describe("Tracking phone number ID or verified external number ID to use as caller ID"),
       customer_phone_number: z.string().describe("10-digit US or Canadian customer phone number"),
       business_phone_number: z.string().describe("10-digit US or Canadian business phone number"),
@@ -279,7 +308,7 @@ function createServer(): McpServer {
     "update_call",
     "Update a call: set tags, note, value, lead status, customer name, or mark as spam.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       call_id: z.string().describe("The call ID to update"),
       tags: z.array(z.string()).optional().describe("Tag names — new tags are created if they don't exist"),
       note: z.string().optional().describe("Text notes. Pass empty string to clear."),
@@ -300,7 +329,7 @@ function createServer(): McpServer {
     "summarize_calls",
     "Return summarized call data, optionally grouped by source, campaign, referrer, landing_page, keywords, company, or company_id.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       company_id: z.string().optional().describe("Filter to a specific company"),
       start_date: z.string().optional().describe("Start date (ISO 8601)"),
       end_date: z.string().optional().describe("End date (ISO 8601)"),
@@ -318,6 +347,7 @@ function createServer(): McpServer {
       agent: z.number().optional().describe("Filter to a specific agent User ID"),
     },
     async ({ account, ...rest }) => {
+      if (!account) return allAccountsRequest((id) => `/a/${id}/calls/summary.json`, rest as Record<string, string | number | boolean | undefined>);
       const result = await acctRequest(account, "GET", (id) => `/a/${id}/calls/summary.json`, rest as Record<string, string | number | boolean | undefined>);
       if ("notFound" in result) return result.notFound;
       return { content: [{ type: "text", text: JSON.stringify(result.data, null, 2) }] };
@@ -328,7 +358,7 @@ function createServer(): McpServer {
     "get_call_timeseries",
     "Retrieve aggregate call data grouped by date. Max 200 data points — use larger intervals for longer ranges.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       company_id: z.string().optional(),
       start_date: z.string().optional(),
       end_date: z.string().optional(),
@@ -356,7 +386,7 @@ function createServer(): McpServer {
     "get_call_recording",
     "Get the MP3 recording URL for a call. For HIPAA accounts URL expires in ~24 hours — do not store it.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       call_id: z.string().describe("The call ID"),
     },
     async ({ account, call_id }) => {
@@ -370,7 +400,7 @@ function createServer(): McpServer {
     "get_call_page_views",
     "Retrieve the browsing history (page views) associated with a call. Only available for session tracker calls. Returned in reverse chronological order.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       call_id: z.string().describe("The call ID"),
       page: z.number().optional(),
       per_page: z.number().optional(),
@@ -390,7 +420,7 @@ function createServer(): McpServer {
     "list_tags",
     "List tags in the account. Filter by company, status, or tag level.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       company_id: z.string().optional(),
       status: z.enum(["enabled", "disabled"]).optional(),
       tag_level: z.enum(["company", "account"]).optional().describe("Cannot combine account with company_id"),
@@ -400,6 +430,7 @@ function createServer(): McpServer {
       sort_dir: z.enum(["asc", "desc"]).optional(),
     },
     async ({ account, ...rest }) => {
+      if (!account) return allAccountsRequest((id) => `/a/${id}/tags.json`, rest as Record<string, string | number | boolean | undefined>);
       const result = await acctRequest(account, "GET", (id) => `/a/${id}/tags.json`, rest as Record<string, string | number | boolean | undefined>);
       if ("notFound" in result) return result.notFound;
       return { content: [{ type: "text", text: JSON.stringify(result.data, null, 2) }] };
@@ -410,7 +441,7 @@ function createServer(): McpServer {
     "create_tag",
     "Create a tag in a company or account.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       name: z.string().describe("Tag name"),
       company_id: z.string().optional().describe("Required for company-level tags (default)"),
       color: z.string().optional().describe("Color name: gray1, gray2, blue1, blue2, cyan1, cyan2, purple1, purple2, pink1-4, red1-2, orange1-4, yellow1-2, green1-4"),
@@ -427,7 +458,7 @@ function createServer(): McpServer {
     "update_tag",
     "Update a tag's name, color, or enabled/disabled status.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       tag_id: z.string().describe("Tag ID to update"),
       name: z.string().optional().describe("New name — updates everywhere the tag is assigned"),
       color: z.string().optional().describe("Color name: gray1, gray2, blue1, blue2, cyan1, cyan2, purple1, purple2, pink1-4, red1-2, orange1-4, yellow1-2, green1-4"),
@@ -444,7 +475,7 @@ function createServer(): McpServer {
     "delete_tag",
     "Permanently delete a tag. Removes from all call flows and interactions. Use update_tag to disable instead of removing history.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       tag_id: z.string().describe("Tag ID to delete"),
     },
     async ({ account, tag_id }) => {
@@ -463,7 +494,7 @@ function createServer(): McpServer {
     "list_companies",
     "List all companies in the account.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       status: z.enum(["active", "disabled"]).optional(),
       search: z.string().optional().describe("Search by name"),
       sort_by: z.string().optional(),
@@ -472,6 +503,7 @@ function createServer(): McpServer {
       per_page: z.number().optional(),
     },
     async ({ account, ...rest }) => {
+      if (!account) return allAccountsRequest((id) => `/a/${id}/companies.json`, rest as Record<string, string | number | boolean | undefined>);
       const result = await acctRequest(account, "GET", (id) => `/a/${id}/companies.json`, rest as Record<string, string | number | boolean | undefined>);
       if ("notFound" in result) return result.notFound;
       return { content: [{ type: "text", text: JSON.stringify(result.data, null, 2) }] };
@@ -482,7 +514,7 @@ function createServer(): McpServer {
     "get_company",
     "Get a single company by ID.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       company_id: z.string().describe("Company ID (e.g. COM8154748ae6bd4e278a7cddd38a662f4f)"),
       fields: z.string().optional().describe("Extra fields: verified_caller_ids"),
     },
@@ -499,7 +531,7 @@ function createServer(): McpServer {
     "create_company",
     "Create a new company in the account.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       name: z.string().describe("Company name"),
       time_zone: z.string().optional().describe("e.g. 'America/New_York'"),
     },
@@ -514,7 +546,7 @@ function createServer(): McpServer {
     "update_company",
     "Update a company. Only provided fields change.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       company_id: z.string().describe("Company ID to update"),
       name: z.string().optional(),
       callscore_enabled: z.boolean().optional(),
@@ -537,7 +569,7 @@ function createServer(): McpServer {
     "bulk_update_companies",
     "Enable or disable external form capture for multiple or all companies.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       company_ids: z.array(z.string()).describe("Array of company IDs, or ['all'] to update all"),
       external_form_capture: z.boolean().optional(),
     },
@@ -552,7 +584,7 @@ function createServer(): McpServer {
     "disable_company",
     "Disable a company. All tracking numbers disabled, swap.js deactivated. Cannot disable the last company.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       company_id: z.string().describe("Company ID to disable"),
     },
     async ({ account, company_id }) => {
@@ -571,7 +603,7 @@ function createServer(): McpServer {
     "list_form_submissions",
     "List all form submissions. Supports filtering by company, date, lead status, tags.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       company_id: z.string().optional(),
       start_date: z.string().optional(),
       end_date: z.string().optional(),
@@ -595,7 +627,7 @@ function createServer(): McpServer {
     "create_form_submission",
     "Create a form submission. CallRail parses phone numbers in form_data to associate with a customer.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       company_id: z.string().describe("Company ID"),
       referrer: z.string().describe("Referring entity name, e.g. 'google_paid'"),
       referring_url: z.string().describe("Referring entity URL"),
@@ -615,7 +647,7 @@ function createServer(): McpServer {
     "update_form_submission",
     "Update a form submission: add tags, note, value, or set lead status.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       form_submission_id: z.string().describe("Form submission ID to update"),
       tags: z.array(z.string()).optional(),
       note: z.string().optional(),
@@ -634,7 +666,7 @@ function createServer(): McpServer {
     "ignore_form_fields",
     "Exclude specific fields from form submissions (retroactively too). CallRail auto-excludes passwords and credit card fields.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       company_ids: z.array(z.string()).describe("Company IDs to configure, or ['all']"),
       field_names: z.array(z.string()).describe("Field names to ignore"),
     },
@@ -649,7 +681,7 @@ function createServer(): McpServer {
     "summarize_forms",
     "Summarized form data grouped by source, keywords, campaign, referrer, landing_page, form_name, or company.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       company_id: z.string().optional(),
       start_date: z.string().optional(),
       end_date: z.string().optional(),
@@ -675,7 +707,7 @@ function createServer(): McpServer {
     "list_integrations",
     "List all integrations for a company. Only Webhooks and Custom types can be created/updated via API.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       company_id: z.string().describe("Required — filter to this company"),
       page: z.number().optional(),
       per_page: z.number().optional(),
@@ -691,7 +723,7 @@ function createServer(): McpServer {
     "get_integration",
     "Get a single integration. Use fields='signing_key' to retrieve the webhook signing secret.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       integration_id: z.string().describe("Integration ID"),
       fields: z.string().optional().describe("Extra fields: signing_key (Webhooks only — store this value)"),
     },
@@ -708,7 +740,7 @@ function createServer(): McpServer {
     "create_integration",
     "Create a Webhooks or Custom integration for a company. Only one of each type per company.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       company_id: z.string().describe("Company ID"),
       type: z.enum(["Webhooks", "Custom"]).describe("Integration type"),
       config: z.record(z.unknown()).describe("For Webhooks: { pre_call_webhook, answered_call_webhook, post_call_webhook, updated_call_webhook, sms_received_webhook, sms_sent_webhook, form_captured_webhook, post_outbound_call_webhook, updated_outbound_call_webhook } — each an array of URLs. For Custom: { grab_cookies: ['cookie1', 'cookie2'] }"),
@@ -724,7 +756,7 @@ function createServer(): McpServer {
     "update_integration",
     "Update a Webhooks or Custom integration.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       integration_id: z.string().describe("Integration ID to update"),
       state: z.enum(["active", "disabled"]).optional(),
       config: z.record(z.unknown()).optional().describe("Updated config object (same format as create_integration)"),
@@ -740,7 +772,7 @@ function createServer(): McpServer {
     "disable_integration",
     "Disable an integration.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       integration_id: z.string().describe("Integration ID to disable"),
     },
     async ({ account, integration_id }) => {
@@ -759,7 +791,7 @@ function createServer(): McpServer {
     "list_integration_filters",
     "List all integration filters for a company.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       company_id: z.string().describe("Required — filter to this company"),
       page: z.number().optional(),
       per_page: z.number().optional(),
@@ -775,7 +807,7 @@ function createServer(): McpServer {
     "get_integration_filter",
     "Get a single integration filter.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       integration_trigger_id: z.string().describe("Integration filter ID"),
     },
     async ({ account, integration_trigger_id }) => {
@@ -789,7 +821,7 @@ function createServer(): McpServer {
     "create_integration_filter",
     "Create an integration filter. Each integration can have one filter.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       company_id: z.string().describe("Company ID"),
       integration_id: z.number().describe("Integration ID to associate with"),
       tracker_ids: z.array(z.string()).optional().describe("Scope filter to specific trackers"),
@@ -809,7 +841,7 @@ function createServer(): McpServer {
     "update_integration_filter",
     "Update an integration filter.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       integration_trigger_id: z.string().describe("Integration filter ID to update"),
       tracker_ids: z.array(z.string()).optional(),
       call_type: z.enum(["null", "first_call", "vm", "missed_and_vm"]).optional(),
@@ -828,7 +860,7 @@ function createServer(): McpServer {
     "delete_integration_filter",
     "Delete an integration filter. Integration continues functioning without any filtering.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       integration_trigger_id: z.string().describe("Integration filter ID to delete"),
     },
     async ({ account, integration_trigger_id }) => {
@@ -847,7 +879,7 @@ function createServer(): McpServer {
     "list_notifications",
     "List notifications (user alerts for calls/texts).",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       user_id: z.string().optional(),
       email: z.string().optional(),
       notification_type: z.enum(["send_desktop", "send_email", "send_push"]).optional(),
@@ -865,7 +897,7 @@ function createServer(): McpServer {
     "create_notification",
     "Create a notification for a user.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       user_id: z.string().optional(),
       email: z.string().optional(),
       agent_id: z.string().optional(),
@@ -889,7 +921,7 @@ function createServer(): McpServer {
     "update_notification",
     "Update a notification.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       notification_id: z.string().describe("Notification ID to update"),
       company_id: z.string().optional(),
       tracker_id: z.string().optional(),
@@ -911,7 +943,7 @@ function createServer(): McpServer {
     "delete_notification",
     "Delete a notification.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       notification_id: z.string().describe("Notification ID to delete"),
     },
     async ({ account, notification_id }) => {
@@ -930,7 +962,7 @@ function createServer(): McpServer {
     "list_caller_ids",
     "List all outbound caller IDs for a company.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       company_id: z.string().describe("Required — filter to this company"),
       page: z.number().optional(),
       per_page: z.number().optional(),
@@ -946,7 +978,7 @@ function createServer(): McpServer {
     "get_caller_id",
     "Get a single outbound caller ID.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       caller_id: z.string().describe("Caller ID object ID"),
     },
     async ({ account, caller_id }) => {
@@ -960,7 +992,7 @@ function createServer(): McpServer {
     "create_caller_id",
     "Register an external phone number as an outbound caller ID.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       company_id: z.string().describe("Company ID"),
       phone_number: z.string().describe("Phone number to verify"),
       name: z.string().describe("Descriptive name for this caller ID"),
@@ -976,7 +1008,7 @@ function createServer(): McpServer {
     "delete_caller_id",
     "Delete an outbound caller ID.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       caller_id: z.string().describe("Caller ID object ID to delete"),
     },
     async ({ account, caller_id }) => {
@@ -995,7 +1027,7 @@ function createServer(): McpServer {
     "list_sms_threads",
     "List SMS threads ordered by most recent message.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       company_id: z.string().optional(),
       date_range: z.string().optional(),
       start_date: z.string().optional(),
@@ -1016,7 +1048,7 @@ function createServer(): McpServer {
     "get_sms_thread",
     "Retrieve a single SMS thread with its messages (newest first).",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       thread_id: z.string().describe("SMS thread ID"),
       page: z.number().optional(),
       per_page: z.number().optional(),
@@ -1033,7 +1065,7 @@ function createServer(): McpServer {
     "update_sms_thread",
     "Update an SMS thread: set notes, value, tags, or lead qualification.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       thread_id: z.string().describe("SMS thread ID to update"),
       notes: z.string().optional(),
       value: z.string().optional(),
@@ -1056,7 +1088,7 @@ function createServer(): McpServer {
     "list_text_conversations",
     "List all text message conversations ordered by most recent message.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       company_id: z.string().optional(),
       date_range: z.string().optional(),
       start_date: z.string().optional(),
@@ -1077,7 +1109,7 @@ function createServer(): McpServer {
     "get_text_conversation",
     "Retrieve a single text message conversation with its messages.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       conversation_id: z.string().describe("Text conversation ID"),
       fields: z.string().optional(),
     },
@@ -1094,7 +1126,7 @@ function createServer(): McpServer {
     "send_text_message",
     "Send an outbound SMS/MMS text message. Person-to-person only — bulk/automated messaging is prohibited.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       company_id: z.string().describe("Company ID"),
       tracking_number: z.number().describe("Tracking number ID to send from"),
       customer_phone_number: z.string().describe("10-digit US or Canadian customer phone number"),
@@ -1115,7 +1147,7 @@ function createServer(): McpServer {
     "list_summary_emails",
     "List summary email subscriptions (periodic activity emails).",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       frequency: z.array(z.enum(["daily", "weekly", "monthly"])).optional(),
       company_id: z.string().optional(),
       user_id: z.string().optional(),
@@ -1134,7 +1166,7 @@ function createServer(): McpServer {
     "get_summary_email",
     "Retrieve a single summary email subscription.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       summary_email_id: z.string().describe("Summary email subscription ID"),
     },
     async ({ account, summary_email_id }) => {
@@ -1148,7 +1180,7 @@ function createServer(): McpServer {
     "create_summary_email",
     "Create a summary email subscription.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       frequency: z.array(z.enum(["daily", "weekly", "monthly"])).describe("Frequencies to subscribe to"),
       config: z.object({
         summary_statistics: z.boolean().optional(),
@@ -1172,7 +1204,7 @@ function createServer(): McpServer {
     "update_summary_email",
     "Update a summary email subscription.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       summary_email_id: z.string().describe("Summary email subscription ID to update"),
       frequency: z.array(z.enum(["daily", "weekly", "monthly"])).optional(),
       config: z.object({
@@ -1194,7 +1226,7 @@ function createServer(): McpServer {
     "delete_summary_email",
     "Delete a summary email subscription.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       summary_email_id: z.string().describe("Summary email subscription ID to delete"),
     },
     async ({ account, summary_email_id }) => {
@@ -1213,7 +1245,7 @@ function createServer(): McpServer {
     "list_message_flows",
     "List all message flows (automated SMS reply configurations) for a company.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       company_id: z.string().optional(),
       page: z.number().optional(),
       per_page: z.number().optional(),
@@ -1229,7 +1261,7 @@ function createServer(): McpServer {
     "get_message_flow",
     "Get a single message flow with its full step configuration.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       message_flow_id: z.string().describe("Message flow ID"),
     },
     async ({ account, message_flow_id }) => {
@@ -1243,7 +1275,7 @@ function createServer(): McpServer {
     "create_message_flow",
     "Create a message flow.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       company_id: z.string().describe("Company ID that owns the message flow"),
       name: z.string().describe("Unique name for the message flow"),
       initial_step_id: z.string().describe("ID of the first step in the flow"),
@@ -1260,7 +1292,7 @@ function createServer(): McpServer {
     "update_message_flow",
     "Update an existing message flow.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       message_flow_id: z.string().describe("Message flow ID to update"),
       name: z.string().optional(),
       initial_step_id: z.string().optional(),
@@ -1281,7 +1313,7 @@ function createServer(): McpServer {
     "list_trackers",
     "List all trackers (tracking numbers). Filter by company, type, or status.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       company_id: z.string().optional(),
       type: z.enum(["session", "source"]).optional(),
       status: z.enum(["active", "disabled"]).optional(),
@@ -1293,6 +1325,7 @@ function createServer(): McpServer {
       fields: z.string().optional(),
     },
     async ({ account, ...rest }) => {
+      if (!account) return allAccountsRequest((id) => `/a/${id}/trackers.json`, rest as Record<string, string | number | boolean | undefined>);
       const result = await acctRequest(account, "GET", (id) => `/a/${id}/trackers.json`, rest as Record<string, string | number | boolean | undefined>);
       if ("notFound" in result) return result.notFound;
       return { content: [{ type: "text", text: JSON.stringify(result.data, null, 2) }] };
@@ -1303,7 +1336,7 @@ function createServer(): McpServer {
     "get_tracker",
     "Get a single tracker (tracking number).",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       tracker_id: z.string().describe("Tracker ID"),
       fields: z.string().optional(),
     },
@@ -1320,7 +1353,7 @@ function createServer(): McpServer {
     "create_tracker",
     "Create a source or session tracker.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       name: z.string().describe("Tracker name"),
       type: z.enum(["source", "session"]),
       company_id: z.string().describe("Company ID"),
@@ -1344,7 +1377,7 @@ function createServer(): McpServer {
     "update_tracker",
     "Update an existing tracker.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       tracker_id: z.string().describe("Tracker ID to update"),
       name: z.string().optional(),
       pool_size: z.number().optional(),
@@ -1367,7 +1400,7 @@ function createServer(): McpServer {
     "disable_tracker",
     "Disable a tracker (tracking number).",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       tracker_id: z.string().describe("Tracker ID to disable"),
     },
     async ({ account, tracker_id }) => {
@@ -1386,7 +1419,7 @@ function createServer(): McpServer {
     "list_users",
     "List all users in the account.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       page: z.number().optional(),
       per_page: z.number().optional(),
       sort_by: z.string().optional(),
@@ -1403,7 +1436,7 @@ function createServer(): McpServer {
     "get_user",
     "Get a single user by ID.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       user_id: z.string().describe("User ID"),
     },
     async ({ account, user_id }) => {
@@ -1417,7 +1450,7 @@ function createServer(): McpServer {
     "create_user",
     "Create a new user.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       first_name: z.string(),
       last_name: z.string(),
       email: z.string(),
@@ -1435,7 +1468,7 @@ function createServer(): McpServer {
     "update_user",
     "Update a user.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       user_id: z.string().describe("User ID to update"),
       first_name: z.string().optional(),
       last_name: z.string().optional(),
@@ -1454,7 +1487,7 @@ function createServer(): McpServer {
     "delete_user",
     "Delete a user from the account.",
     {
-      account: z.string().describe("Account name — fuzzy matched."),
+      account: z.string().optional().describe("Account name — fuzzy matched. Available accounts: blue interactive, moment of clarity, thomas homes. Leave blank to query all accounts."),
       user_id: z.string().describe("User ID to delete"),
     },
     async ({ account, user_id }) => {
