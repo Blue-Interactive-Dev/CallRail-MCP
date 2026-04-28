@@ -1,3 +1,4 @@
+import crypto from "crypto";
 import express from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -44,6 +45,13 @@ function loadAccounts(): AccountsMap {
 const ACCOUNTS: AccountsMap = loadAccounts();
 const PORT = parseInt(process.env.PORT || "3000", 10);
 const BASE_URL = "https://api.callrail.com/v3";
+const AUTH_TOKEN = process.env.MCP_AUTH_TOKEN || "";
+
+if (!AUTH_TOKEN) {
+  console.warn("[callrail-mcp] WARNING: MCP_AUTH_TOKEN not set — all MCP requests will be rejected");
+} else {
+  console.log(`[callrail-mcp] MCP_AUTH_TOKEN loaded (prefix=${AUTH_TOKEN.slice(0, 6)}..., length=${AUTH_TOKEN.length})`);
+}
 
 // ---------------------------------------------------------------------------
 // Fuzzy account resolver
@@ -1508,11 +1516,88 @@ function createServer(): McpServer {
 const app = express();
 app.use(express.json());
 
-app.get("/health", (_req, res) => {
-  res.json({ status: "ok", service: "callrail-mcp", accounts: Object.keys(ACCOUNTS) });
+// ---------------------------------------------------------------------------
+// Auth middleware — token via ?token= query param or Authorization: Bearer header
+// ---------------------------------------------------------------------------
+function extractToken(req: express.Request): { token: string | null; source: string } {
+  const authHeader = req.headers.authorization;
+  if (authHeader) {
+    const parts = authHeader.split(/\s+/);
+    if (parts.length === 2 && parts[0].toLowerCase() === "bearer") {
+      return { token: parts[1], source: "header" };
+    }
+    return { token: authHeader, source: "header_malformed" };
+  }
+  const queryToken = req.query.token;
+  if (typeof queryToken === "string" && queryToken) {
+    return { token: queryToken, source: "query" };
+  }
+  return { token: null, source: "none" };
+}
+
+function timingSafeEqual(a: string, b: string): boolean {
+  const bufA = crypto.createHash("sha256").update(a).digest();
+  const bufB = crypto.createHash("sha256").update(b).digest();
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
+const PUBLIC_PATHS = new Set(["/", "/health"]);
+
+app.use((req, res, next) => {
+  console.log(`[callrail-mcp] Incoming: ${req.method} ${req.path}`);
+
+  if (PUBLIC_PATHS.has(req.path)) return next();
+
+  if (!AUTH_TOKEN) {
+    console.error("[callrail-mcp] Rejecting: MCP_AUTH_TOKEN not set");
+    return res.status(500).json({ error: "server_misconfigured", detail: "MCP_AUTH_TOKEN not set" });
+  }
+
+  const { token, source } = extractToken(req);
+
+  if (!token) {
+    console.warn("[callrail-mcp] No token provided — 401");
+    return res.status(401).json({ error: "unauthorized", detail: "missing token" });
+  }
+  if (source === "header_malformed") {
+    console.warn("[callrail-mcp] Malformed Authorization header — 401");
+    return res.status(401).json({ error: "unauthorized", detail: "malformed Authorization header" });
+  }
+  if (!timingSafeEqual(token, AUTH_TOKEN)) {
+    console.warn(`[callrail-mcp] Token mismatch (source=${source}) — 401`);
+    return res.status(401).json({ error: "unauthorized", detail: "invalid token" });
+  }
+
+  console.log(`[callrail-mcp] Auth OK via ${source}`);
+
+  // Normalize Accept header for MCP SDK compliance
+  const accept = req.headers.accept || "";
+  if (req.path.startsWith("/mcp") && !(accept.includes("application/json") && accept.includes("text/event-stream"))) {
+    req.headers.accept = "application/json, text/event-stream";
+    console.log("[callrail-mcp] Rewrote Accept header for MCP SDK compliance");
+  }
+
+  next();
 });
 
-app.all("/mcp", async (req, res) => {
+// ---------------------------------------------------------------------------
+// Routes
+// ---------------------------------------------------------------------------
+app.get("/", (_req, res) => {
+  res.json({
+    service: "callrail-mcp",
+    status: "ok",
+    mcp_endpoint: "/mcp",
+    auth: "query param (?token=) or Bearer header",
+    token_configured: !!AUTH_TOKEN,
+  });
+});
+
+app.get("/health", (_req, res) => {
+  res.json({ status: "ok", service: "callrail-mcp", accounts: Object.keys(ACCOUNTS), token_configured: !!AUTH_TOKEN });
+});
+
+app.all(["/mcp", "/mcp/"], async (req, res) => {
   try {
     const server = createServer();
     const transport = new StreamableHTTPServerTransport({
