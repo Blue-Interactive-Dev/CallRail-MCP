@@ -1543,8 +1543,25 @@ function timingSafeEqual(a: string, b: string): boolean {
 
 const PUBLIC_PATHS = new Set(["/", "/health"]);
 
+// OAuth auto-discovery paths probed by MCP clients (e.g. Claude's connector)
+// BEFORE they present a token. This server does not implement OAuth — it uses a
+// static ?token= / Bearer secret. Returning 401 here makes the client attempt an
+// OAuth flow that doesn't exist and the connection fails. Return 404 instead so
+// the client concludes "no OAuth" and falls back to the query-param token.
+const OAUTH_DISCOVERY_PATHS = new Set([
+  "/.well-known/oauth-protected-resource",
+  "/.well-known/oauth-authorization-server",
+  "/.well-known/openid-configuration",
+  "/register",
+]);
+
 app.use((req, res, next) => {
   console.log(`[callrail-mcp] Incoming: ${req.method} ${req.path}`);
+
+  // OAuth discovery probes: 404 (not 401) so clients fall back to ?token= auth.
+  if (OAUTH_DISCOVERY_PATHS.has(req.path) || req.path.startsWith("/.well-known/")) {
+    return res.status(404).json({ error: "not_found" });
+  }
 
   if (PUBLIC_PATHS.has(req.path)) return next();
 
